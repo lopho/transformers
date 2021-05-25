@@ -1289,9 +1289,9 @@ class PreTrainedModel(nn.Module, ModuleUtilsMixin, GenerationMixin, PushToHubMix
 
         # copy state_dict so _load_from_state_dict can modify it
         metadata = getattr(state_dict, "_metadata", None)
-        state_dict = state_dict.copy()
-        if metadata is not None:
-            state_dict._metadata = metadata
+        #state_dict = state_dict.copy()
+        #if metadata is not None:
+        #    state_dict._metadata = metadata
 
         error_msgs = []
 

@@ -39,6 +39,7 @@ from .generation_logits_process import (
     TemperatureLogitsWarper,
     TopKLogitsWarper,
     TopPLogitsWarper,
+    TailFreeSamplingLogitsWarper,
 )
 from .generation_stopping_criteria import (
     MaxLengthCriteria,
@@ -521,7 +522,7 @@ class GenerationMixin:
         )
 
     def _get_logits_warper(
-        self, top_k: int = None, top_p: float = None, temperature: float = None, num_beams: int = None
+        self, top_k: int = None, top_p: float = None, tfs: float = None, temperature: float = None, num_beams: int = None
     ) -> LogitsProcessorList:
         """
         This class returns a :obj:`~transformers.LogitsProcessorList` list object that contains all relevant
@@ -531,6 +532,7 @@ class GenerationMixin:
         # init warp parameters
         top_k = top_k if top_k is not None else self.config.top_k
         top_p = top_p if top_p is not None else self.config.top_p
+        tfs = tfs
         temperature = temperature if temperature is not None else self.config.temperature
         # instantiate warpers list
         warpers = LogitsProcessorList()
@@ -543,11 +545,15 @@ class GenerationMixin:
             warpers.append(TopKLogitsWarper(top_k=top_k, min_tokens_to_keep=(2 if num_beams > 1 else 1)))
         if top_p is not None and top_p < 1.0:
             warpers.append(TopPLogitsWarper(top_p=top_p, min_tokens_to_keep=(2 if num_beams > 1 else 1)))
+        if tfs is not None and tfs < 1.0:
+            warpers.append(TailFreeSamplingLogitsWarper(threshold=tfs))
         return warpers
 
     def _get_logits_processor(
         self,
         repetition_penalty: float,
+        repetition_penalty_range: int,
+        repetition_penalty_slope: float,
         no_repeat_ngram_size: int,
         encoder_no_repeat_ngram_size: int,
         encoder_input_ids: torch.LongTensor,
@@ -603,7 +609,7 @@ class GenerationMixin:
                 )
             )
         if repetition_penalty is not None and repetition_penalty != 1.0:
-            processors.append(RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty))
+            processors.append(RepetitionPenaltyLogitsProcessor(penalty=repetition_penalty, m=repetition_penalty_slope, penalize_last=repetition_penalty_range))
         if no_repeat_ngram_size is not None and no_repeat_ngram_size > 0:
             processors.append(NoRepeatNGramLogitsProcessor(no_repeat_ngram_size))
         if encoder_no_repeat_ngram_size is not None and encoder_no_repeat_ngram_size > 0:
@@ -651,7 +657,10 @@ class GenerationMixin:
         temperature: Optional[float] = None,
         top_k: Optional[int] = None,
         top_p: Optional[float] = None,
+        tfs: Optional[float] = None,
         repetition_penalty: Optional[float] = None,
+        repetition_penalty_range: Optional[int] = None,
+        repetition_penalty_slope: Optional[float] = 3.33,
         bad_words_ids: Optional[Iterable[int]] = None,
         bos_token_id: Optional[int] = None,
         pad_token_id: Optional[int] = None,
@@ -709,6 +718,8 @@ class GenerationMixin:
             top_p (:obj:`float`, `optional`, defaults to 1.0):
                 If set to float < 1, only the most probable tokens with probabilities that add up to :obj:`top_p` or
                 higher are kept for generation.
+            tfs (:obj:`float`, `optional`, defaults to 1.0):
+                If set to float < 1, only the most probable according to tail free sampling are kept for generation.
             repetition_penalty (:obj:`float`, `optional`, defaults to 1.0):
                 The parameter for repetition penalty. 1.0 means no penalty. See `this paper
                 <https://arxiv.org/pdf/1909.05858.pdf>`__ for more details.
@@ -944,6 +955,8 @@ class GenerationMixin:
         # get distribution pre_processing samplers
         logits_processor = self._get_logits_processor(
             repetition_penalty=repetition_penalty,
+            repetition_penalty_range=repetition_penalty_range,
+            repetition_penalty_slope=repetition_penalty_slope,
             no_repeat_ngram_size=no_repeat_ngram_size,
             encoder_no_repeat_ngram_size=encoder_no_repeat_ngram_size,
             encoder_input_ids=encoder_input_ids,
@@ -984,7 +997,7 @@ class GenerationMixin:
         elif is_sample_gen_mode:
             # get probability distribution warper
             logits_warper = self._get_logits_warper(
-                top_k=top_k, top_p=top_p, temperature=temperature, num_beams=num_beams
+                top_k=top_k, top_p=top_p, tfs=tfs, temperature=temperature, num_beams=num_beams
             )
 
             # expand input_ids with `num_return_sequences` additional sequences per batch
@@ -1048,7 +1061,7 @@ class GenerationMixin:
 
         elif is_beam_sample_gen_mode:
             logits_warper = self._get_logits_warper(
-                top_k=top_k, top_p=top_p, temperature=temperature, num_beams=num_beams
+                top_k=top_k, top_p=top_p, tfs=tfs, temperature=temperature, num_beams=num_beams
             )
 
             batch_size = input_ids.shape[0] * num_return_sequences
@@ -1548,7 +1561,7 @@ class GenerationMixin:
 
             # sample
             probs = F.softmax(next_token_scores, dim=-1)
-            next_tokens = torch.multinomial(probs, num_samples=1).squeeze(1)
+            next_tokens = torch.multinomial(probs.float(), num_samples=1).squeeze(1)
 
             # finished sentences should have their next token be a padding token
             if eos_token_id is not None:
@@ -2113,7 +2126,7 @@ class GenerationMixin:
 
             probs = F.softmax(next_token_scores, dim=-1)
 
-            next_tokens = torch.multinomial(probs, num_samples=2 * num_beams)
+            next_tokens = torch.multinomial(probs.float(), num_samples=2 * num_beams)
             next_token_scores = torch.gather(next_token_scores, -1, next_tokens)
 
             next_token_scores, _indices = torch.sort(next_token_scores, descending=True, dim=1)
@@ -2532,6 +2545,7 @@ def top_k_top_p_filtering(
     logits: torch.FloatTensor,
     top_k: int = 0,
     top_p: float = 1.0,
+    tfs: float = 1.0,
     filter_value: float = -float("Inf"),
     min_tokens_to_keep: int = 1,
 ) -> torch.FloatTensor:
@@ -2543,6 +2557,8 @@ def top_k_top_p_filtering(
         if top_k > 0: keep only top k tokens with highest probability (top-k filtering).
         if top_p < 1.0: keep the top tokens with cumulative probability >= top_p (nucleus filtering).
             Nucleus filtering is described in Holtzman et al. (http://arxiv.org/abs/1904.09751)
+        if tfs < 1.0: keep the top tokens according to tail free sampling.
+            Tail free sampling is described in: https://trentbrick.github.io/Tail-Free-Sampling/
         Make sure we keep at least min_tokens_to_keep per batch example in the output
     From: https://gist.github.com/thomwolf/1a5a29f6962089e871b94cbd09daf317
     """
@@ -2553,5 +2569,8 @@ def top_k_top_p_filtering(
 
     if 0 <= top_p <= 1.0:
         logits = TopPLogitsWarper(top_p=top_p, min_tokens_to_keep=min_tokens_to_keep)(None, logits)
+
+    if 0 <= tfs <= 1.0:
+        logits = TailFreeSamplingLogitsWarper(threshold=tfs)(None, logits)
 
     return logits
